@@ -5,6 +5,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <err.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#ifndef ELEM_T
+#define ELEM_T uint32_t
+#endif
+
+bool _debugmod = false;
 
 #define verify(x)                                                      \
     do {                                                               \
@@ -39,6 +50,26 @@ static inline void swapfunc(char *, char *, int, int);
             *pj++ = t;                  \
         } while (--i > 0);              \
     }
+
+static inline int lvnodecnt(size_t lv)
+{
+    return ((1 << ((lv) + 1)) - 1) - (1 << (lv)) + 1;
+}
+
+static inline int gettreelv(size_t n)
+{
+    size_t lv = 0;
+
+    while (1)
+    {
+        if ((1 << lv) <= (n) &&
+            (n) <= ((1 << (lv + 1)) - 1))
+        {
+            return lv - 1;
+        }
+        lv ++;
+    }
+}
 
 static inline void swapfunc(char *a, char *b, int n, int swaptype)
 {
@@ -89,7 +120,8 @@ struct heapsort {
     enum thread_state st;   /* For coordinating work. */
     struct common *common;  /* Common shared elements. */
     void *a;                /* Array base. */
-    size_t n;               /* Number of elements. */
+    size_t ne;             /* Number of elements. */
+    size_t n;               /* Node number. */
     pthread_t id;           /* Thread id. */
     pthread_mutex_t mtx_st; /* For signalling state change. */
     pthread_cond_t cond_st; /* For signalling state change. */
@@ -110,6 +142,40 @@ struct common {
 
 static void *heapsort_thread(void *p);
 
+// To heapify a subtree rooted with node i
+// which is an index in arr[].
+// n is size of heap
+void heapify(int arr[], int N, int i)
+{
+ 
+    // Initialize largest as root
+    int largest = i;
+ 
+    // left = 2*i + 1
+    int l = 2 * i + 1;
+ 
+    // right = 2*i + 2
+    int r = 2 * i + 2;
+ 
+    // If left child is larger than root
+    if (l < N && arr[l] > arr[largest])
+        largest = l;
+ 
+    // If right child is larger than largest
+    // so far
+    if (r < N && arr[r] > arr[largest])
+        largest = r;
+ 
+    // If largest is not root
+    if (largest != i) {
+        swap(arr[i], arr[largest]);
+ 
+        // Recursively heapify the affected
+        // sub-tree
+        heapify(arr, N, largest);
+    }
+}
+
 /* The multithreaded heapsort public interface */
 void heapsort_mt(void *a,
                  size_t n,
@@ -118,9 +184,9 @@ void heapsort_mt(void *a,
                  int maxthreads,
                  int forkelem)
 {
-    struct heapsort *qs;
+    struct heapsort *hs;
     struct common c;
-    int i, islot;
+    int islot;
     bool bailout = true;
 
     if (n < forkelem)
@@ -132,18 +198,18 @@ void heapsort_mt(void *a,
     if ((c.pool = calloc(maxthreads, sizeof(struct heapsort))) == NULL)
         goto f2;
     for (islot = 0; islot < maxthreads; islot++) {
-        qs = &c.pool[islot];
-        if (pthread_mutex_init(&qs->mtx_st, NULL) != 0)
+        hs = &c.pool[islot];
+        if (pthread_mutex_init(&hs->mtx_st, NULL) != 0)
             goto f3;
-        if (pthread_cond_init(&qs->cond_st, NULL) != 0) {
-            verify(pthread_mutex_destroy(&qs->mtx_st));
+        if (pthread_cond_init(&hs->cond_st, NULL) != 0) {
+            verify(pthread_mutex_destroy(&hs->mtx_st));
             goto f3;
         }
-        qs->st = ts_idle;
-        qs->common = &c;
-        if (pthread_create(&qs->id, NULL, heapsort_thread, qs) != 0) {
-            verify(pthread_mutex_destroy(&qs->mtx_st));
-            verify(pthread_cond_destroy(&qs->cond_st));
+        hs->st = ts_idle;
+        hs->common = &c;
+        if (pthread_create(&hs->id, NULL, heapsort_thread, hs) != 0) {
+            verify(pthread_mutex_destroy(&hs->mtx_st));
+            verify(pthread_cond_destroy(&hs->cond_st));
             goto f3;
         }
     }
@@ -162,28 +228,69 @@ void heapsort_mt(void *a,
     c.idlethreads = c.nthreads = maxthreads;
 
     /* Hand out the first work batch. */
-    qs = &c.pool[0];
-    verify(pthread_mutex_lock(&qs->mtx_st));
-    qs->a = a;
-    qs->n = n;
-    qs->st = ts_work;
-    c.idlethreads--;
-    verify(pthread_cond_signal(&qs->cond_st));
-    verify(pthread_mutex_unlock(&qs->mtx_st));
-
+    for (int lv = gettreelv(n) ; lv >= 0 ; lv--)
+    {
+        int levelnodecnt = lvnodecnt(lv);
+        size_t startnode = (1 << lv) - 1;
+        if (_debugmod)
+        {
+            printf("Level : %d\n", lv);
+            printf("levelnodecnt : %d\n", levelnodecnt);
+            printf("startnode : %ld\n", startnode);
+        }
+        while(1)
+        {
+            for (islot = 0; islot < maxthreads; islot++)
+            {
+                hs = &c.pool[islot];
+                if (hs->st == ts_idle)
+                {
+                    verify(pthread_mutex_lock(&hs->mtx_st));
+                    hs->st = ts_work;
+                    hs->a = (char *) a + ((startnode + levelnodecnt - 1) * es);
+                    hs->ne = n;
+                    hs->n = startnode + levelnodecnt - 1;
+                    c.idlethreads--;
+                    verify(pthread_cond_signal(&hs->cond_st));
+                    verify(pthread_mutex_unlock(&hs->mtx_st));
+                    levelnodecnt--;
+                }
+                if (levelnodecnt < 1)
+                    break;
+            }
+            if (levelnodecnt < 1)
+                break;
+        };
+        for (islot = 0; islot < maxthreads; islot++)
+        {
+            hs = &c.pool[islot];
+            while (hs->st == ts_work)
+            {
+                continue;
+            }
+        }
+        if (_debugmod)
+            printf("Finish Level Round.\n");
+    }
+    if (_debugmod)
+        printf("Finish Sort.\n");
     /* Wait for all threads to finish, and free acquired resources. */
 f3:
-    for (i = 0; i < islot; i++) {
-        qs = &c.pool[i];
+    for (islot = 0; islot < maxthreads; islot++) {
+        hs = &c.pool[islot];
         if (bailout) {
-            verify(pthread_mutex_lock(&qs->mtx_st));
-            qs->st = ts_term;
-            verify(pthread_cond_signal(&qs->cond_st));
-            verify(pthread_mutex_unlock(&qs->mtx_st));
+            verify(pthread_mutex_lock(&hs->mtx_st));
+            hs->st = ts_term;
+            verify(pthread_cond_signal(&hs->cond_st));
+            verify(pthread_mutex_unlock(&hs->mtx_st));
         }
-        verify(pthread_join(qs->id, NULL));
-        verify(pthread_mutex_destroy(&qs->mtx_st));
-        verify(pthread_cond_destroy(&qs->cond_st));
+        verify(pthread_mutex_lock(&hs->mtx_st));
+        hs->st = ts_term;
+        verify(pthread_cond_signal(&hs->cond_st));
+        verify(pthread_mutex_unlock(&hs->mtx_st));
+        verify(pthread_join(hs->id, NULL));
+        verify(pthread_mutex_destroy(&hs->mtx_st));
+        verify(pthread_cond_destroy(&hs->cond_st));
     }
     free(c.pool);
 f2:
@@ -195,190 +302,85 @@ f2:
     }
 }
 
-#define thunk NULL
-
-/* Allocate an idle thread from the pool, lock its mutex, change its state to
- * work, decrease the number of idle threads, and return a pointer to its data
- * area.
- * Return NULL, if no thread is available.
- */
-static struct heapsort *allocate_thread(struct common *c)
-{
-    verify(pthread_mutex_lock(&c->mtx_al));
-    for (int i = 0; i < c->nthreads; i++)
-        if (c->pool[i].st == ts_idle) {
-            c->idlethreads--;
-            verify(pthread_mutex_lock(&c->pool[i].mtx_st));
-            c->pool[i].st = ts_work;
-            verify(pthread_mutex_unlock(&c->mtx_al));
-            return (&c->pool[i]);
-        }
-    verify(pthread_mutex_unlock(&c->mtx_al));
-    return (NULL);
-}
+#define thunk NULLx
 
 /* Thread-callable quicksort. */
-static void heapsort_algo(struct heapsort *qs)
+static void heapsort_algo(struct heapsort *hs)
 {
-    char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
-    int d, r, swaptype, swap_cnt;
-    void *a;      /* Array of elements. */
-    size_t n, es; /* Number of elements; size. */
+    int swaptype;
+    void *a;            /* Array of elements. */
+    size_t n, es, ne;   /* Number of elements; size. */
     cmp_t *cmp;
-    int nl, nr;
     struct common *c;
-    struct heapsort *qs2;
 
     /* Initialize heapsort arguments. */
-    c = qs->common;
+    c = hs->common;
     es = c->es;
     cmp = c->cmp;
     swaptype = c->swaptype;
-    a = qs->a;
-    n = qs->n;
-top:
+    a = hs->a;
+    n = hs->n;
+    ne = hs->ne;
+
     /* From here on heapsort(3) business as usual. */
-    swap_cnt = 0;
-    if (n < 7) {
-        for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
-            for (pl = pm; pl > (char *) a && CMP(thunk, pl - es, pl) > 0;
-                 pl -= es)
-                swap(pl, pl - es);
-        return;
-    }
-    pm = (char *) a + (n / 2) * es;
-    if (n > 7) {
-        pl = (char *) a;
-        pn = (char *) a + (n - 1) * es;
-        if (n > 40) {
-            d = (n / 8) * es;
-            pl = med3(pl, pl + d, pl + 2 * d, cmp, thunk);
-            pm = med3(pm - d, pm, pm + d, cmp, thunk);
-            pn = med3(pn - 2 * d, pn - d, pn, cmp, thunk);
-        }
-        pm = med3(pl, pm, pn, cmp, thunk);
-    }
-    swap(a, pm);
-    pa = pb = (char *) a + es;
+    size_t leftSide = 2 * n + 1;
+    size_t rightSide = 2 * n + 2;
+    size_t greatest = n;
 
-    pc = pd = (char *) a + (n - 1) * es;
-    for (;;) {
-        while (pb <= pc && (r = CMP(thunk, pb, a)) <= 0) {
-            if (r == 0) {
-                swap_cnt = 1;
-                swap(pa, pb);
-                pa += es;
-            }
-            pb += es;
-        }
-        while (pb <= pc && (r = CMP(thunk, pc, a)) >= 0) {
-            if (r == 0) {
-                swap_cnt = 1;
-                swap(pc, pd);
-                pd -= es;
-            }
-            pc -= es;
-        }
-        if (pb > pc)
-            break;
-        swap(pb, pc);
-        swap_cnt = 1;
-        pb += es;
-        pc -= es;
+    if (_debugmod)
+    {
+        printf("Work Node : %ld, Val : %u\n", n, *(ELEM_T *) a);
+        if (leftSide < ne)
+            printf("Work Node Left : %ld, Val : %u\n", leftSide, *(ELEM_T *)((char *) a + (leftSide - n) * es));
+        if (rightSide < ne)
+            printf("Work Node Righ : %ld, Val : %u\n", rightSide, *(ELEM_T *)((char *) a + (rightSide - n) * es));
     }
 
-    pn = (char *) a + n * es;
-    r = min(pa - (char *) a, pb - pa);
-    vecswap(a, pb - r, r);
-    r = min(pd - pc, pn - pd - es);
-    vecswap(pb, pn - r, r);
+    if (leftSide < ne && CMP(thunk, (char *) a + (leftSide - n) * es, (char *) a + (greatest - n) * es) < 0)
+        greatest = leftSide;
 
-    if (swap_cnt == 0) { /* Switch to insertion sort */
-        r = 1 + n / 4;   /* n >= 7, so r >= 2 */
-        for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
-            for (pl = pm; pl > (char *) a && CMP(thunk, pl - es, pl) > 0;
-                 pl -= es) {
-                swap(pl, pl - es);
-                if (++swap_cnt > r)
-                    goto nevermind;
-            }
-        return;
-    }
+    if (rightSide < ne && CMP(thunk, (char *) a + (rightSide - n) * es, (char *) a + (greatest - n) * es) < 0)
+        greatest = rightSide;
 
-nevermind:
-    nl = (pb - pa) / es;
-    nr = (pd - pc) / es;
-
-    /* Now try to launch subthreads. */
-    if (nl > c->forkelem && nr > c->forkelem &&
-        (qs2 = allocate_thread(c)) != NULL) {
-        qs2->a = a;
-        qs2->n = nl;
-        verify(pthread_cond_signal(&qs2->cond_st));
-        verify(pthread_mutex_unlock(&qs2->mtx_st));
-    } else if (nl > 0) {
-        qs->a = a;
-        qs->n = nl;
-        heapsort_algo(qs);
-    }
-    if (nr > 0) {
-        a = pn - nr * es;
-        n = nr;
-        goto top;
+    /* Swap and continue heapifying if the root is not the greatest */
+    if (greatest != n) {
+        if (_debugmod)
+            printf("Swap : (%ld, %ld)\n", n, greatest);
+        swap(a, ((char *) a + (greatest - n) * es));
+        hs->a = (char *) a + (greatest - n) * es;
+        hs->ne = ne;
+        hs->n = greatest;
+        heapsort_algo(hs);
     }
 }
 
 /* Thread-callable quicksort. */
 static void *heapsort_thread(void *p)
 {
-    struct heapsort *qs, *qs2;
-    int i;
+    struct heapsort *hs;
     struct common *c;
 
-    qs = p;
-    c = qs->common;
+    hs = p;
+    c = hs->common;
 again:
     /* Wait for work to be allocated. */
-    verify(pthread_mutex_lock(&qs->mtx_st));
-    while (qs->st == ts_idle)
-        verify(pthread_cond_wait(&qs->cond_st, &qs->mtx_st));
-    verify(pthread_mutex_unlock(&qs->mtx_st));
-    if (qs->st == ts_term) {
+    verify(pthread_mutex_lock(&hs->mtx_st));
+    while (hs->st == ts_idle)
+        verify(pthread_cond_wait(&hs->cond_st, &hs->mtx_st));
+    verify(pthread_mutex_unlock(&hs->mtx_st));
+    if (hs->st == ts_term) {
         return NULL;
     }
-    assert(qs->st == ts_work);
+    assert(hs->st == ts_work);
 
-    heapsort_algo(qs);
+    heapsort_algo(hs);
 
     verify(pthread_mutex_lock(&c->mtx_al));
-    qs->st = ts_idle;
+    hs->st = ts_idle;
     c->idlethreads++;
-    if (c->idlethreads == c->nthreads) {
-        for (i = 0; i < c->nthreads; i++) {
-            qs2 = &c->pool[i];
-            if (qs2 == qs)
-                continue;
-            verify(pthread_mutex_lock(&qs2->mtx_st));
-            qs2->st = ts_term;
-            verify(pthread_cond_signal(&qs2->cond_st));
-            verify(pthread_mutex_unlock(&qs2->mtx_st));
-        }
-        verify(pthread_mutex_unlock(&c->mtx_al));
-        return NULL;
-    }
     verify(pthread_mutex_unlock(&c->mtx_al));
     goto again;
 }
-
-#include <err.h>
-#include <stdint.h>
-#include <sys/resource.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-#ifndef ELEM_T
-#define ELEM_T uint32_t
-#endif
 
 int num_compare(const void *a, const void *b)
 {
@@ -408,6 +410,7 @@ void usage(void)
         "usage: heapsort_mt [-stv] [-f forkelements] [-h threads] [-n elements]\n"
         "\t-s\tTest with 20-byte strings, instead of integers\n"
         "\t-t\tPrint timing results\n"
+        "\t-d\tPrint tree operation log\n"
         "\t-v\tVerify the integer results\n"
         "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
     exit(1);
@@ -422,7 +425,7 @@ int main(int argc, char *argv[])
     int ch, i;
     size_t nelem = 10000000;
     int threads = 2;
-    int forkelements = 100;
+    int forkelements = 10;
     ELEM_T *int_elem;
     char *ep;
     char **str_elem;
@@ -465,6 +468,9 @@ int main(int argc, char *argv[])
         case 'v':
             opt_verify = true;
             break;
+        case 'd':
+            _debugmod = true;
+            break;
         case '?':
         default:
             usage();
@@ -488,6 +494,7 @@ int main(int argc, char *argv[])
         int_elem = xmalloc(nelem * sizeof(ELEM_T));
         for (i = 0; i < nelem; i++)
             int_elem[i] = rand() % nelem;
+        printf("\n");
     }
     if (opt_str) {
         if (opt_libc)
