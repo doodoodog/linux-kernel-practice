@@ -145,36 +145,36 @@ static void *heapsort_thread(void *p);
 // To heapify a subtree rooted with node i
 // which is an index in arr[].
 // n is size of heap
-void heapify(int arr[], int N, int i)
-{
+// void heapify(int arr[], int N, int i)
+// {
  
-    // Initialize largest as root
-    int largest = i;
+//     // Initialize largest as root
+//     int largest = i;
  
-    // left = 2*i + 1
-    int l = 2 * i + 1;
+//     // left = 2*i + 1
+//     int l = 2 * i + 1;
  
-    // right = 2*i + 2
-    int r = 2 * i + 2;
+//     // right = 2*i + 2
+//     int r = 2 * i + 2;
  
-    // If left child is larger than root
-    if (l < N && arr[l] > arr[largest])
-        largest = l;
+//     // If left child is larger than root
+//     if (l < N && arr[l] > arr[largest])
+//         largest = l;
  
-    // If right child is larger than largest
-    // so far
-    if (r < N && arr[r] > arr[largest])
-        largest = r;
+//     // If right child is larger than largest
+//     // so far
+//     if (r < N && arr[r] > arr[largest])
+//         largest = r;
  
-    // If largest is not root
-    if (largest != i) {
-        swap(arr[i], arr[largest]);
+//     // If largest is not root
+//     if (largest != i) {
+//         swap(arr[i], arr[largest]);
  
-        // Recursively heapify the affected
-        // sub-tree
-        heapify(arr, N, largest);
-    }
-}
+//         // Recursively heapify the affected
+//         // sub-tree
+//         heapify(arr, N, largest);
+//     }
+// }
 
 /* The multithreaded heapsort public interface */
 void heapsort_mt(void *a,
@@ -227,50 +227,65 @@ void heapsort_mt(void *a,
     c.forkelem = forkelem;
     c.idlethreads = c.nthreads = maxthreads;
 
-    /* Hand out the first work batch. */
-    for (int lv = gettreelv(n) ; lv >= 0 ; lv--)
+    for(int i = 0; i < n - 1; i ++)
     {
-        int levelnodecnt = lvnodecnt(lv);
-        size_t startnode = (1 << lv) - 1;
-        if (_debugmod)
+        unsigned int uTotalNode = n - i;
+
+        for (int lv = gettreelv(uTotalNode) ; lv >= 0 ; lv--)
         {
-            printf("Level : %d\n", lv);
-            printf("levelnodecnt : %d\n", levelnodecnt);
-            printf("startnode : %ld\n", startnode);
-        }
-        while(1)
-        {
-            for (islot = 0; islot < maxthreads; islot++)
+            int levelnodecnt = lvnodecnt(lv);
+            size_t startnode = (1 << lv) - 1;
+            if (_debugmod)
             {
-                hs = &c.pool[islot];
-                if (hs->st == ts_idle)
+                printf("Level : %d\n", lv);
+                printf("levelnodecnt : %d\n", levelnodecnt);
+                printf("startnode : %ld\n", startnode);
+            }
+            while(1)
+            {
+                for (islot = 0; islot < maxthreads; islot++)
                 {
-                    verify(pthread_mutex_lock(&hs->mtx_st));
-                    hs->st = ts_work;
-                    hs->a = (char *) a + ((startnode + levelnodecnt - 1) * es);
-                    hs->ne = n;
-                    hs->n = startnode + levelnodecnt - 1;
-                    c.idlethreads--;
-                    verify(pthread_cond_signal(&hs->cond_st));
-                    verify(pthread_mutex_unlock(&hs->mtx_st));
-                    levelnodecnt--;
+                    hs = &c.pool[islot];
+                    if (hs->st == ts_idle)
+                    {
+                        verify(pthread_mutex_lock(&hs->mtx_st));
+                        hs->st = ts_work;
+                        hs->a = (char *) a + ((startnode + levelnodecnt - 1) * es);
+                        hs->ne = uTotalNode;
+                        hs->n = startnode + levelnodecnt - 1;
+                        c.idlethreads--;
+                        verify(pthread_cond_signal(&hs->cond_st));
+                        verify(pthread_mutex_unlock(&hs->mtx_st));
+                        levelnodecnt--;
+                    }
+                    if (levelnodecnt < 1)
+                        break;
                 }
                 if (levelnodecnt < 1)
                     break;
-            }
-            if (levelnodecnt < 1)
-                break;
-        };
-        for (islot = 0; islot < maxthreads; islot++)
-        {
-            hs = &c.pool[islot];
-            while (hs->st == ts_work)
+            };
+            for (islot = 0; islot < maxthreads; islot++)
             {
-                continue;
+                hs = &c.pool[islot];
+                while (hs->st == ts_work)
+                {
+                    continue;
+                }
             }
+            if (_debugmod)
+                printf("Finish Level Round.\n");
         }
+        swap(a, ((char *) a + (uTotalNode - 1) * es));
         if (_debugmod)
-            printf("Finish Level Round.\n");
+        {
+            printf("========= Dump Fill Tree =========\n");
+            for(unsigned int j = 0; j < n; j++)
+            {
+                printf("%u ", *(ELEM_T *)((char *) a + j * es));
+            }
+            printf("\n");
+            printf("==================================\n");
+        }
     }
     if (_debugmod)
         printf("Finish Sort.\n");
