@@ -15,6 +15,10 @@
 #define ELEM_T uint32_t
 #endif
 
+#ifndef thunk
+#define thunk NULLx
+#endif
+
 bool _debugmod = false;
 
 #define verify(x)                                                      \
@@ -142,39 +146,83 @@ struct common {
 
 static void *heapsort_thread(void *p);
 
-// To heapify a subtree rooted with node i
-// which is an index in arr[].
-// n is size of heap
-// void heapify(int arr[], int N, int i)
-// {
- 
-//     // Initialize largest as root
-//     int largest = i;
- 
-//     // left = 2*i + 1
-//     int l = 2 * i + 1;
- 
-//     // right = 2*i + 2
-//     int r = 2 * i + 2;
- 
-//     // If left child is larger than root
-//     if (l < N && arr[l] > arr[largest])
-//         largest = l;
- 
-//     // If right child is larger than largest
-//     // so far
-//     if (r < N && arr[r] > arr[largest])
-//         largest = r;
- 
-//     // If largest is not root
-//     if (largest != i) {
-//         swap(arr[i], arr[largest]);
- 
-//         // Recursively heapify the affected
-//         // sub-tree
-//         heapify(arr, N, largest);
-//     }
-// }
+static void minHeapify(void *a, struct common *c, int start, int heapSize)
+{
+    cmp_t *cmp;
+    cmp = c->cmp;
+    size_t es = c->es;
+    int swaptype = c->swaptype;
+    int least = start;
+    int childL = start * 2 + 1;
+    int childR = start * 2 + 2;
+
+    if (childL < heapSize && CMP(thunk, (char *) a + childL * es, (char *) a + least * es) < 0)
+        least = childL;
+    
+    if (childR < heapSize && CMP(thunk, (char *) a + childR * es, (char *) a + least * es) < 0)
+        least = childR;
+
+    /* Swap and continue heapifying if the root is not the greatest */
+    if (least != start)
+    {
+        swap((char *) a + start * es, (char *) a + least * es);
+        minHeapify(a, c, least, heapSize);
+    }
+}
+
+void heapSort(void *a, int heapSize, size_t es, cmp_t *cmp)
+{
+    int i;
+    struct common c;
+
+    /* Initialize common elements. */
+    c.swaptype = ((char *) a - (char *) 0) % sizeof(long) || es % sizeof(long)
+                     ? 2
+                 : es == sizeof(long) ? 0
+                                      : 1;
+    c.es = es;
+    c.cmp = cmp;
+
+    int swaptype = c.swaptype;
+
+    if (_debugmod)
+    {
+        printf("[%s, %d][Debug Mode] Bef. Sort\n", __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ========= Dump Fill Tree =========\n",
+                __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ",__func__, __LINE__);
+        for(unsigned int j = 0; j < heapSize; j++)
+        {
+            printf("%u ", *(ELEM_T *)((char *) a + j * es));
+        }
+        printf("\n");
+        printf("[%s, %d][Debug Mode] ==================================\n",
+                __func__, __LINE__);
+    }
+
+    for(i = (heapSize / 2) - 1; i >= 0; i--)
+    {
+        minHeapify(a, &c, i, heapSize);
+    }
+    for(i = heapSize - 1; i > 0; i--){
+        swap(a, ((char *) a + i * es));
+        minHeapify(a, &c, 0, i);
+    }
+    if (_debugmod)
+    {
+        printf("[%s, %d][Debug Mode] Aft. Sort\n", __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ========= Dump Fill Tree =========\n",
+                __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ",__func__, __LINE__);
+        for(unsigned int j = 0; j < heapSize; j++)
+        {
+            printf("%u ", *(ELEM_T *)((char *) a + j * es));
+        }
+        printf("\n");
+        printf("[%s, %d][Debug Mode] ==================================\n",
+                __func__, __LINE__);
+    }
+}
 
 /* The multithreaded heapsort public interface */
 void heapsort_mt(void *a,
@@ -227,68 +275,86 @@ void heapsort_mt(void *a,
     c.forkelem = forkelem;
     c.idlethreads = c.nthreads = maxthreads;
 
-    for(int i = 0; i < n - 1; i ++)
+    if (_debugmod)
     {
-        unsigned int uTotalNode = n - i;
-
-        for (int lv = gettreelv(uTotalNode) ; lv >= 0 ; lv--)
+        printf("[%s, %d][Debug Mode] Bef. Sort\n", __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ========= Dump Fill Tree =========\n",
+                __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ",__func__, __LINE__);
+        for(unsigned int j = 0; j < n; j++)
         {
-            int levelnodecnt = lvnodecnt(lv);
-            size_t startnode = (1 << lv) - 1;
-            if (_debugmod)
-            {
-                printf("Level : %d\n", lv);
-                printf("levelnodecnt : %d\n", levelnodecnt);
-                printf("startnode : %ld\n", startnode);
-            }
-            while(1)
-            {
-                for (islot = 0; islot < maxthreads; islot++)
-                {
-                    hs = &c.pool[islot];
-                    if (hs->st == ts_idle)
-                    {
-                        verify(pthread_mutex_lock(&hs->mtx_st));
-                        hs->st = ts_work;
-                        hs->a = (char *) a + ((startnode + levelnodecnt - 1) * es);
-                        hs->ne = uTotalNode;
-                        hs->n = startnode + levelnodecnt - 1;
-                        c.idlethreads--;
-                        verify(pthread_cond_signal(&hs->cond_st));
-                        verify(pthread_mutex_unlock(&hs->mtx_st));
-                        levelnodecnt--;
-                    }
-                    if (levelnodecnt < 1)
-                        break;
-                }
-                if (levelnodecnt < 1)
-                    break;
-            };
+            printf("%u ", *(ELEM_T *)((char *) a + j * es));
+        }
+        printf("\n");
+        printf("[%s, %d][Debug Mode] ==================================\n",
+                __func__, __LINE__);
+    }
+
+    for (int lv = gettreelv(n) ; lv >= 0 ; lv--)
+    {
+        int levelnodecnt = lvnodecnt(lv);
+        size_t startnode = (1 << lv) - 1;
+        if (_debugmod)
+        {
+            printf("[%s, %d][Debug Mode] Level : %d\n", __func__, __LINE__, lv);
+            printf("[%s, %d][Debug Mode] levelnodecnt : %d\n", __func__, __LINE__, levelnodecnt);
+            printf("[%s, %d][Debug Mode] startnode : %ld\n", __func__, __LINE__, startnode);
+        }
+        while(1)
+        {
             for (islot = 0; islot < maxthreads; islot++)
             {
                 hs = &c.pool[islot];
-                while (hs->st == ts_work)
+                if (hs->st == ts_idle)
                 {
-                    continue;
+                    verify(pthread_mutex_lock(&hs->mtx_st));
+                    hs->st = ts_work;
+                    hs->a = (char *) a + ((startnode + levelnodecnt - 1) * es);
+                    hs->ne = n;
+                    hs->n = startnode + levelnodecnt - 1;
+                    c.idlethreads--;
+                    verify(pthread_cond_signal(&hs->cond_st));
+                    verify(pthread_mutex_unlock(&hs->mtx_st));
+                    levelnodecnt--;
                 }
+                if (levelnodecnt < 1)
+                    break;
             }
-            if (_debugmod)
-                printf("Finish Level Round.\n");
-        }
-        swap(a, ((char *) a + (uTotalNode - 1) * es));
-        if (_debugmod)
+            if (levelnodecnt < 1)
+                break;
+        };
+        for (islot = 0; islot < maxthreads; islot++)
         {
-            printf("========= Dump Fill Tree =========\n");
-            for(unsigned int j = 0; j < n; j++)
+            hs = &c.pool[islot];
+            while (hs->st == ts_work)
             {
-                printf("%u ", *(ELEM_T *)((char *) a + j * es));
+                continue;
             }
-            printf("\n");
-            printf("==================================\n");
         }
+        if (_debugmod)
+            printf("[%s, %d][Debug Mode] Finish First Sort.\n",
+                    __func__, __LINE__);
+    }
+    for(int i = n - 1; i > 0; i--)
+    {
+        int swaptype = c.swaptype;
+        swap(a, ((char *) a + i * es));
+        minHeapify(a, &c, 0, i);
     }
     if (_debugmod)
-        printf("Finish Sort.\n");
+    {
+        printf("[%s, %d][Debug Mode] Aft. Sort\n", __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ========= Dump Fill Tree =========\n",
+                __func__, __LINE__);
+        printf("[%s, %d][Debug Mode] ",__func__, __LINE__);
+        for(unsigned int j = 0; j < n; j++)
+        {
+            printf("%u ", *(ELEM_T *)((char *) a + j * es));
+        }
+        printf("\n");
+        printf("[%s, %d][Debug Mode] ==================================\n",
+                __func__, __LINE__);
+    }
     /* Wait for all threads to finish, and free acquired resources. */
 f3:
     for (islot = 0; islot < maxthreads; islot++) {
@@ -317,8 +383,6 @@ f2:
     }
 }
 
-#define thunk NULLx
-
 /* Thread-callable quicksort. */
 static void heapsort_algo(struct heapsort *hs)
 {
@@ -344,11 +408,14 @@ static void heapsort_algo(struct heapsort *hs)
 
     if (_debugmod)
     {
-        printf("Work Node : %ld, Val : %u\n", n, *(ELEM_T *) a);
+        printf("[%s, %d][Debug Mode] Work Node : %ld, Val : %u\n",
+                __func__, __LINE__, n, *(ELEM_T *) a);
         if (leftSide < ne)
-            printf("Work Node Left : %ld, Val : %u\n", leftSide, *(ELEM_T *)((char *) a + (leftSide - n) * es));
+            printf("[%s, %d][Debug Mode] Work Node Left : %ld, Val : %u\n",
+                    __func__, __LINE__, leftSide, *(ELEM_T *)((char *) a + (leftSide - n) * es));
         if (rightSide < ne)
-            printf("Work Node Righ : %ld, Val : %u\n", rightSide, *(ELEM_T *)((char *) a + (rightSide - n) * es));
+            printf("[%s, %d][Debug Mode] Work Node Righ : %ld, Val : %u\n",
+                    __func__, __LINE__, rightSide, *(ELEM_T *)((char *) a + (rightSide - n) * es));
     }
 
     if (leftSide < ne && CMP(thunk, (char *) a + (leftSide - n) * es, (char *) a + (greatest - n) * es) < 0)
@@ -360,7 +427,8 @@ static void heapsort_algo(struct heapsort *hs)
     /* Swap and continue heapifying if the root is not the greatest */
     if (greatest != n) {
         if (_debugmod)
-            printf("Swap : (%ld, %ld)\n", n, greatest);
+            printf("[%s, %d][Debug Mode] Swap : (%ld, %ld)\n",
+                    __func__, __LINE__, n, greatest);
         swap(a, ((char *) a + (greatest - n) * es));
         hs->a = (char *) a + (greatest - n) * es;
         hs->ne = ne;
@@ -448,7 +516,7 @@ int main(int argc, char *argv[])
     struct rusage ru;
 
     gettimeofday(&start, NULL);
-    while ((ch = getopt(argc, argv, "f:h:ln:stv")) != -1) {
+    while ((ch = getopt(argc, argv, "f:h:ln:stvd")) != -1) {
         switch (ch) {
         case 'f':
             forkelements = (int) strtol(optarg, &ep, 10);
@@ -513,13 +581,13 @@ int main(int argc, char *argv[])
     }
     if (opt_str) {
         if (opt_libc)
-            qsort(str_elem, nelem, sizeof(char *), string_compare);
+            heapSort(str_elem, nelem, sizeof(char *), string_compare);
         else
             heapsort_mt(str_elem, nelem, sizeof(char *), string_compare, threads,
                         forkelements);
     } else {
         if (opt_libc)
-            qsort(int_elem, nelem, sizeof(ELEM_T), num_compare);
+            heapSort(int_elem, nelem, sizeof(ELEM_T), num_compare);
         else
             heapsort_mt(int_elem, nelem, sizeof(ELEM_T), num_compare, threads,
                         forkelements);
