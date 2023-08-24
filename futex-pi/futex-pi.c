@@ -61,6 +61,7 @@ int main() {
         st = pthread_create(&th[i], &attr, (void *)TASKS[i], NULL);
         if (st != 0) {
             printf("Failed to spawn thread %d: %s\n", i, strerror(-st));
+            return 1;
         }
     }
 
