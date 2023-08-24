@@ -1,4 +1,4 @@
-CFLAGS = -Wall -fno-stack-protector -I. -pthread -lpthread -fsanitize=thread
+CFLAGS = -Wall -fno-stack-protector -I. -pthread -lpthread # -fsanitize=thread
 CC := gcc
 
 all:
