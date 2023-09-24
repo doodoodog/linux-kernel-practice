@@ -39,6 +39,7 @@
 typedef struct work_internal *(*task_t)(struct work_internal *);
 
 typedef struct work_internal {
+    struct common *common;  /* Common shared elements. */
     task_t code;
     atomic_int join_count;
     void *args[];
@@ -61,6 +62,16 @@ typedef struct {
     atomic_size_t top, bottom;
     _Atomic(array_t *) array;
 } deque_t;
+
+/* Invariant common part, shared across invocations. */
+struct common {
+    int swaptype;           /* Code to use for swapping */
+    size_t es;              /* Element size. */
+    void *thunk;            /* Thunk for qsort_r */
+    int nthreads;           /* Total number of pool threads. */
+    int idlethreads;        /* Number of idle threads in pool. */
+    int forkelem;           /* Minimum number of elements for a new thread. */
+};
 
 void init(deque_t *q, int size_hint)
 {
@@ -283,20 +294,103 @@ void *xmalloc(size_t s)
 
 void usage(void)
 {
-    // fprintf(
-    //     stderr,
-    //     "usage: qsort_mt [-stv] [-f forkelements] [-h threads] [-n elements]\n"
-    //     "\t-l\tRun the libc version of qsort\n"
-    //     "\t-s\tTest with 20-byte strings, instead of integers\n"
-    //     "\t-t\tPrint timing results\n"
-    //     "\t-v\tVerify the integer results\n"
-    //     "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
+    fprintf(
+        stderr,
+        "usage: qsort_mt [-stv] [-f forkelements] [-h threads] [-n elements]\n"
+        "\t-l\tRun the libc version of qsort\n"
+        "\t-s\tTest with 20-byte strings, instead of integers\n"
+        "\t-t\tPrint timing results\n"
+        "\t-v\tVerify the integer results\n"
+        "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
     exit(1);
+}
+
+/* The multithreaded qsort public interface */
+void qsort_mt(void *a,
+              size_t n,
+              size_t es,
+              int maxthreads,
+              int forkelem)
+{
+    struct qsort *qs;
+    struct common c;
+    int i, islot;
+    bool bailout = true;
+
+    if (n < forkelem)
+        goto f1;
+    errno = 0;
+    /* Try to initialize the resources we need. */
+    if (pthread_mutex_init(&c.mtx_al, NULL) != 0)
+        goto f1;
+    if ((c.pool = calloc(maxthreads, sizeof(struct qsort))) == NULL)
+        goto f2;
+    for (islot = 0; islot < maxthreads; islot++) {
+        qs = &c.pool[islot];
+        if (pthread_mutex_init(&qs->mtx_st, NULL) != 0)
+            goto f3;
+        if (pthread_cond_init(&qs->cond_st, NULL) != 0) {
+            verify(pthread_mutex_destroy(&qs->mtx_st));
+            goto f3;
+        }
+        qs->st = ts_idle;
+        qs->common = &c;
+        if (pthread_create(&qs->id, NULL, qsort_thread, qs) != 0) {
+            verify(pthread_mutex_destroy(&qs->mtx_st));
+            verify(pthread_cond_destroy(&qs->cond_st));
+            goto f3;
+        }
+    }
+
+    /* All systems go. */
+    bailout = false;
+
+    /* Initialize common elements. */
+    c.swaptype = ((char *) a - (char *) 0) % sizeof(long) || es % sizeof(long)
+                     ? 2
+                 : es == sizeof(long) ? 0
+                                      : 1;
+    c.es = es;
+    c.cmp = cmp;
+    c.forkelem = forkelem;
+    c.idlethreads = c.nthreads = maxthreads;
+
+    /* Hand out the first work batch. */
+    qs = &c.pool[0];
+    verify(pthread_mutex_lock(&qs->mtx_st));
+    qs->a = a;
+    qs->n = n;
+    qs->st = ts_work;
+    c.idlethreads--;
+    verify(pthread_cond_signal(&qs->cond_st));
+    verify(pthread_mutex_unlock(&qs->mtx_st));
+
+    /* Wait for all threads to finish, and free acquired resources. */
+f3:
+    for (i = 0; i < islot; i++) {
+        qs = &c.pool[i];
+        if (bailout) {
+            verify(pthread_mutex_lock(&qs->mtx_st));
+            qs->st = ts_term;
+            verify(pthread_cond_signal(&qs->cond_st));
+            verify(pthread_mutex_unlock(&qs->mtx_st));
+        }
+        verify(pthread_join(qs->id, NULL));
+        verify(pthread_mutex_destroy(&qs->mtx_st));
+        verify(pthread_cond_destroy(&qs->cond_st));
+    }
+    free(c.pool);
+f2:
+    verify(pthread_mutex_destroy(&c.mtx_al));
+    if (bailout) {
+        fprintf(stderr, "Resource initialization failed; bailing out.\n");
+    f1:
+        qsort(a, n, es, cmp);
+    }
 }
 
 int main(int argc, char *argv[])
 {
-    bool opt_str = false;
     bool opt_time = false;
     bool opt_verify = false;
     bool opt_libc = false;
@@ -337,9 +431,6 @@ int main(int argc, char *argv[])
                 usage();
             }
             break;
-        case 's':
-            opt_str = true;
-            break;
         case 't':
             opt_time = true;
             break;
@@ -352,56 +443,80 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (opt_verify && opt_str)
+    if (opt_verify)
         usage();
 
     argc -= optind;
     argv += optind;
 
-    // /* Check that top and bottom are 64-bit so they never overflow */
-    // static_assert(sizeof(atomic_size_t) == 8,
-    //               "Assume atomic_size_t is 8 byte wide");
+    int_elem = xmalloc(nelem * sizeof(ELEM_T));
+    for (i = 0; i < nelem; i++)
+        int_elem[i] = rand() % nelem;
 
-    // pthread_t threads[N_THREADS];
-    // int tids[N_THREADS];
-    // thread_queues = malloc(N_THREADS * sizeof(deque_t));
-    // int nprints = 10;
+    /* Check that top and bottom are 64-bit so they never overflow */
+    static_assert(sizeof(atomic_size_t) == 8,
+                  "Assume atomic_size_t is 8 byte wide");
 
-    // atomic_store(&done, false);
-    // work_t *done_work = malloc(sizeof(work_t));
-    // done_work->code = &done_task;
-    // done_work->join_count = N_THREADS * nprints;
+    pthread_t threads[N_THREADS];
+    int tids[N_THREADS];
+    thread_queues = malloc(N_THREADS * sizeof(deque_t));
+    int nprints = 10;
 
-    // for (int i = 0; i < N_THREADS; ++i) {
-    //     tids[i] = i;
-    //     init(&thread_queues[i], 8);
-    //     for (int j = 0; j < nprints; ++j) {
-    //         work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
-    //         work->code = &print_task;
-    //         work->join_count = 0;
-    //         int *payload = malloc(sizeof(int));
-    //         *payload = 1000 * i + j;
-    //         work->args[0] = payload;
-    //         work->args[1] = done_work;
-    //         push(&thread_queues[i], work);
-    //     }
-    // }
+    atomic_store(&done, false);
+    work_t *done_work = malloc(sizeof(work_t));
+    done_work->code = &done_task;
+    done_work->join_count = N_THREADS * nprints;
 
-    // for (int i = 0; i < N_THREADS; ++i) {
-    //     if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
-    //         perror("Failed to start the thread");
-    //         exit(EXIT_FAILURE);
-    //     }
-    // }
+    for (int i = 0; i < N_THREADS; ++i) {
+        tids[i] = i;
+        init(&thread_queues[i], 8);
+        for (int j = 0; j < nprints; ++j) {
+            work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
+            work->code = &print_task;
+            work->join_count = 0;
+            int *payload = malloc(sizeof(int));
+            *payload = 1000 * i + j;
+            work->args[0] = payload;
+            work->args[1] = done_work;
+            push(&thread_queues[i], work);
+        }
+    }
 
-    // for (int i = 0; i < N_THREADS; ++i) {
-    //     if (pthread_join(threads[i], NULL) != 0) {
-    //         perror("Failed to join the thread");
-    //         exit(EXIT_FAILURE);
-    //     }
-    // }
-    // printf("Expect %d lines of output (including this one)\n",
-    //        2 * N_THREADS * nprints + N_THREADS + 2);
+    for (int i = 0; i < N_THREADS; ++i) {
+        if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
+            perror("Failed to start the thread");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < N_THREADS; ++i) {
+        if (pthread_join(threads[i], NULL) != 0) {
+            perror("Failed to join the thread");
+            exit(EXIT_FAILURE);
+        }
+    }
+    printf("Expect %d lines of output (including this one)\n",
+           2 * N_THREADS * nprints + N_THREADS + 2);
+
+    gettimeofday(&end, NULL);
+    getrusage(RUSAGE_SELF, &ru);
+    if (opt_verify) {
+        for (i = 1; i < nelem; i++)
+            if (int_elem[i - 1] > int_elem[i]) {
+                fprintf(stderr,
+                        "sort error at position %d: "
+                        " %d > %d\n",
+                        i, int_elem[i - 1], int_elem[i]);
+                exit(2);
+            }
+    }
+
+    if (opt_time)
+        printf(
+            "%.3g %.3g %.3g\n",
+            (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1e6,
+            ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,
+            ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
 
     return 0;
 }
