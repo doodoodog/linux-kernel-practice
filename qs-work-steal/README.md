@@ -1,6 +1,6 @@
 Run :
-$ gcc -O2 -Wall -std=c11 -o work-steal work-steal.c -lpthread
-$ ./work-steal
+$ gcc -O2 -Wall -std=c11 -o work-steal-qsort work-steal-qsort.c -lpthread
+$ ./work-steal-qsort
 ...
 work ter 1 finished
 work item 10 finished

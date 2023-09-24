@@ -10,20 +10,17 @@
  * the essential idea of work stealing mentioned in Leiserson and Platt,
  * Programming Parallel Applications in Cilk
  */
-
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <err.h>
 #include <sys/resource.h>
 #include <sys/time.h>
-
-struct work_internal;
+#include <unistd.h>
 
 /* A 'task_t' represents a function pointer that accepts a pointer to a 'work_t'
  * struct as input and returns another 'work_t' struct as output. The input to
@@ -42,8 +39,6 @@ struct work_internal;
 typedef struct work_internal *(*task_t)(struct work_internal *);
 
 typedef struct work_internal {
-    int thread_id;
-    int fork_elems;
     task_t code;
     atomic_int join_count;
     void *args[];
@@ -67,27 +62,6 @@ typedef struct {
     _Atomic(array_t *) array;
 } deque_t;
 
-#ifndef ELEM_T
-#define ELEM_T uint32_t
-#endif
-
-#ifndef thunk
-#define thunk NULL
-#endif thunk
-
-// ============ Quick Sort Parameters ============
-typedef struct quick_sort_param_task {
-    void *qs_addr;
-    size_t qs_n;
-} qs_param_t;
-// ===============================================
-
-typedef int cmp_t(const void *, const void *);
-int num_compare(const void *a, const void *b)
-{
-    return (*(ELEM_T *) a - *(ELEM_T *) b);
-}
-
 void init(deque_t *q, int size_hint)
 {
     atomic_init(&q->top, 0);
@@ -97,12 +71,29 @@ void init(deque_t *q, int size_hint)
     atomic_init(&q->array, a);
 }
 
+#ifndef ELEM_T
+#define ELEM_T uint32_t
+#endif
+
+#ifndef thunk
+#define thunk NULL
+#endif
+
+#ifndef N_THREADS
+#define N_THREADS 24
+#endif
+
+deque_t *thread_queues;
+atomic_bool done;
+
 void resize(deque_t *q)
 {
     array_t *a = atomic_load_explicit(&q->array, memory_order_relaxed);
     size_t old_size = a->size;
+
     size_t new_size = old_size * 2;
     array_t *new = malloc(sizeof(array_t) + sizeof(work_t *) * new_size);
+
     atomic_init(&new->size, new_size);
     size_t t = atomic_load_explicit(&q->top, memory_order_relaxed);
     size_t b = atomic_load_explicit(&q->bottom, memory_order_relaxed);
@@ -139,16 +130,16 @@ work_t *take(deque_t *q)
         x = atomic_load_explicit(&a->buffer[b % a->size], memory_order_relaxed);
         if (t == b) {
             /* Single last element in queue */
-            if (!atomic_compare_exchange_strong_explicit(&q->top, &t, t + 1,        // Mask - AAA => t + 1
+            if (!atomic_compare_exchange_strong_explicit(&q->top, &t, t + 1,
                                                          memory_order_seq_cst,
                                                          memory_order_relaxed))
                 /* Failed race */
                 x = EMPTY;
-            atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);         // Mask - BBBB => b + 1
+            atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);
         }
     } else { /* Empty queue */
         x = EMPTY;
-        atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);             // Mask - CCCC => b + 1
+        atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);
     }
     return x;
 }
@@ -164,7 +155,7 @@ void push(deque_t *q, work_t *w)
     }
     atomic_store_explicit(&a->buffer[b % a->size], w, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);                 // Mask - DDDD => b + 1
+    atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);
 }
 
 work_t *steal(deque_t *q)
@@ -178,17 +169,12 @@ work_t *steal(deque_t *q)
         array_t *a = atomic_load_explicit(&q->array, memory_order_consume);
         x = atomic_load_explicit(&a->buffer[t % a->size], memory_order_relaxed);
         if (!atomic_compare_exchange_strong_explicit(
-                &q->top, &t, t + 1, memory_order_seq_cst, memory_order_relaxed))    // Mask - EEEE => t + 1
+                &q->top, &t, t + 1, memory_order_seq_cst, memory_order_relaxed))
             /* Failed race */
             return ABORT;
     }
     return x;
 }
-
-#define N_THREADS 24
-deque_t *thread_queues;
-
-atomic_bool done;
 
 /* Returns the subsequent item available for processing, or NULL if no items
  * are remaining.
@@ -261,9 +247,10 @@ void *thread(void *payload)
     return NULL;
 }
 
-work_t *qs_algo_task(work_t *w)
+work_t *print_task(work_t *w)
 {
-    qs_param_t *qs_param = (qs_param_t*)w->args[0];
+    int *payload = (int *) w->args[0];
+    int item = *payload;
     printf("Did item %p with payload %d\n", w, item);
     work_t *cont = (work_t *) w->args[1];
     free(payload);
@@ -271,122 +258,9 @@ work_t *qs_algo_task(work_t *w)
     return join_work(cont);
 }
 
-/* Thread-callable quicksort. */
-static void qsort_algo(work_t *w)
+int num_compare(const void *a, const void *b)
 {
-    qs_param_t *qs_param = (qs_param_t*)w->args[0];
-    char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
-    int d, r, swaptype, swap_cnt;
-    void *a;      /* Array of elements. */
-    size_t n, es; /* Number of elements; size. */
-    cmp_t *cmp;
-    int nl, nr;
-    work_t *work2;
-
-    /* Initialize qsort arguments. */
-    es = sizeof(ELEM_T);
-    cmp = num_compare;
-    swaptype = 2;
-    a = qs_param->qs_addr;
-    n = qs_param->qs_n;
-top:
-    /* From here on qsort(3) business as usual. */
-    swap_cnt = 0;
-    if (n < 7) {
-        for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
-            for (pl = pm; pl > (char *) a && CMP(thunk, pl - es, pl) > 0;
-                 pl -= es)
-                swap(pl, pl - es);
-        return;
-    }
-    pm = (char *) a + (n / 2) * es;
-    if (n > 7) {
-        pl = (char *) a;
-        pn = (char *) a + (n - 1) * es;
-        if (n > 40) {
-            d = (n / 8) * es;
-            pl = med3(pl, pl + d, pl + 2 * d, cmp, thunk);
-            pm = med3(pm - d, pm, pm + d, cmp, thunk);
-            pn = med3(pn - 2 * d, pn - d, pn, cmp, thunk);
-        }
-        pm = med3(pl, pm, pn, cmp, thunk);
-    }
-    swap(a, pm);
-    pa = pb = (char *) a + es;
-
-    pc = pd = (char *) a + (n - 1) * es;
-    for (;;) {
-        while (pb <= pc && (r = CMP(thunk, pb, a)) <= 0) {
-            if (r == 0) {
-                swap_cnt = 1;
-                swap(pa, pb);
-                pa += es;
-            }
-            pb += es;
-        }
-        while (pb <= pc && (r = CMP(thunk, pc, a)) >= 0) {
-            if (r == 0) {
-                swap_cnt = 1;
-                swap(pc, pd);
-                pd -= es;
-            }
-            pc -= es;
-        }
-        if (pb > pc)
-            break;
-        swap(pb, pc);
-        swap_cnt = 1;
-        pb += es;
-        pc -= es;
-    }
-
-    pn = (char *) a + n * es;
-    r = min(pa - (char *) a, pb - pa);
-    vecswap(a, pb - r, r);
-    r = min(pd - pc, pn - pd - es);
-    vecswap(pb, pn - r, r);
-
-    if (swap_cnt == 0) { /* Switch to insertion sort */
-        r = 1 + n / 4;   /* n >= 7, so r >= 2 */
-        for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
-            for (pl = pm; pl > (char *) a && CMP(thunk, pl - es, pl) > 0;
-                 pl -= es) {
-                swap(pl, pl - es);
-                if (++swap_cnt > r)
-                    goto nevermind;
-            }
-        return;
-    }
-
-nevermind:
-    nl = (pb - pa) / es;
-    nr = (pd - pc) / es;
-
-    /* Now try to launch subthreads. */
-    if (nl > w->fork_elems &&
-        (work2 = malloc(sizeof(work_t) + 2 * sizeof(void *)) != NULL))
-    {   /* Push new work into work queue. */
-        work2->code = &qsort_algo;
-        work2->join_count = 0;
-        qs_param_t* qs_param2 = malloc(sizeof(qs_param_t));
-        qs_param2->qs_addr = a;
-        qs_param2->qs_n = nl;
-        work2->thread_id = 0;
-        work2->fork_elems = w->fork_elems;
-        work2->args[0] = qs_param;
-        work2->args[1] = w->args[1];
-        push(&thread_queues[0], work);
-    }
-    } else if (nl > 0) {
-        qs_param = a;
-        qs->n = nl;
-        qsort_algo(qs);
-    }
-    if (nr > 0) {
-        a = pn - nr * es;
-        n = nr;
-        goto top;
-    }
+    return (*(ELEM_T *) a - *(ELEM_T *) b);
 }
 
 work_t *done_task(work_t *w)
@@ -396,27 +270,39 @@ work_t *done_task(work_t *w)
     return NULL;
 }
 
+void *xmalloc(size_t s)
+{
+    void *p;
+
+    if ((p = malloc(s)) == NULL) {
+        perror("malloc");
+        exit(1);
+    }
+    return (p);
+}
+
 void usage(void)
 {
-    fprintf(
-        stderr,
-        "usage: qsort_mt [-stv] [-f forkelements] [-h threads] [-n elements]\n"
-        "\t-l\tRun the libc version of qsort\n"
-        "\t-s\tTest with 20-byte strings, instead of integers\n"
-        "\t-t\tPrint timing results\n"
-        "\t-v\tVerify the integer results\n"
-        "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
+    // fprintf(
+    //     stderr,
+    //     "usage: qsort_mt [-stv] [-f forkelements] [-h threads] [-n elements]\n"
+    //     "\t-l\tRun the libc version of qsort\n"
+    //     "\t-s\tTest with 20-byte strings, instead of integers\n"
+    //     "\t-t\tPrint timing results\n"
+    //     "\t-v\tVerify the integer results\n"
+    //     "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
     exit(1);
 }
 
-int main(int argc, char **argv)
+int main(int argc, char *argv[])
 {
+    bool opt_str = false;
     bool opt_time = false;
     bool opt_verify = false;
     bool opt_libc = false;
-    int ch;
+    int ch, i;
     size_t nelem = 10000000;
-    int maxthreads = 2;
+    int threads = 2;
     int forkelements = 100;
     ELEM_T *int_elem;
     char *ep;
@@ -435,8 +321,8 @@ int main(int argc, char **argv)
             }
             break;
         case 'h':
-            maxthreads = (int) strtol(optarg, &ep, 10);
-            if (maxthreads < 0 || *ep != '\0') {
+            threads = (int) strtol(optarg, &ep, 10);
+            if (threads < 0 || *ep != '\0') {
                 warnx("illegal number, -h argument -- %s", optarg);
                 usage();
             }
@@ -472,76 +358,50 @@ int main(int argc, char **argv)
     argc -= optind;
     argv += optind;
 
+    // /* Check that top and bottom are 64-bit so they never overflow */
+    // static_assert(sizeof(atomic_size_t) == 8,
+    //               "Assume atomic_size_t is 8 byte wide");
 
-    int_elem = xmalloc(nelem * sizeof(ELEM_T));
-    for (int i = 0; i < nelem; i++)
-        int_elem[i] = rand() % nelem;
+    // pthread_t threads[N_THREADS];
+    // int tids[N_THREADS];
+    // thread_queues = malloc(N_THREADS * sizeof(deque_t));
+    // int nprints = 10;
 
-    /* Check that top and bottom are 64-bit so they never overflow */
-    static_assert(sizeof(atomic_size_t) == 8,
-                  "Assume atomic_size_t is 8 byte wide");
+    // atomic_store(&done, false);
+    // work_t *done_work = malloc(sizeof(work_t));
+    // done_work->code = &done_task;
+    // done_work->join_count = N_THREADS * nprints;
 
-    pthread_t threads[N_THREADS];
-    int tids[N_THREADS];
-    thread_queues = malloc(N_THREADS * sizeof(deque_t));
-    int nprints = 10;
+    // for (int i = 0; i < N_THREADS; ++i) {
+    //     tids[i] = i;
+    //     init(&thread_queues[i], 8);
+    //     for (int j = 0; j < nprints; ++j) {
+    //         work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
+    //         work->code = &print_task;
+    //         work->join_count = 0;
+    //         int *payload = malloc(sizeof(int));
+    //         *payload = 1000 * i + j;
+    //         work->args[0] = payload;
+    //         work->args[1] = done_work;
+    //         push(&thread_queues[i], work);
+    //     }
+    // }
 
-    atomic_store(&done, false);
-    work_t *done_work = malloc(sizeof(work_t));
-    done_work->code = &done_task;
-    done_work->join_count = N_THREADS * nprints;
-    for (int i = 0; i < N_THREADS; ++i) {
-        tids[i] = i;
-        init(&thread_queues[i], 8);
-    }
+    // for (int i = 0; i < N_THREADS; ++i) {
+    //     if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
+    //         perror("Failed to start the thread");
+    //         exit(EXIT_FAILURE);
+    //     }
+    // }
 
-    work_t *work = malloc(sizeof(work_t) + 2 * sizeof(void *));
-    work->code = &qsort_algo;
-    work->join_count = 0;
-    qs_param_t* qs_param = malloc(sizeof(qs_param_t));
-    qs_param->qs_addr = int_elem;
-    qs_param->qs_n = nelem;
-    work->thread_id = 0;
-    work->fork_elems = forkelements;
-    work->args[0] = qs_param;
-    work->args[1] = done_work;
-    push(&thread_queues[0], work);
-
-    for (int i = 0; i < N_THREADS; ++i) {
-        if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
-            perror("Failed to start the thread");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    for (int i = 0; i < N_THREADS; ++i) {
-        if (pthread_join(threads[i], NULL) != 0) {
-            perror("Failed to join the thread");
-            exit(EXIT_FAILURE);
-        }
-    }
-    printf("Expect %d lines of output (including this one)\n",
-           2 * N_THREADS * nprints + N_THREADS + 2);
-
-    gettimeofday(&end, NULL);
-    getrusage(RUSAGE_SELF, &ru);
-    if (opt_verify) {
-        for (i = 1; i < nelem; i++)
-            if (int_elem[i - 1] > int_elem[i]) {
-                fprintf(stderr,
-                        "sort error at position %d: "
-                        " %d > %d\n",
-                        i, int_elem[i - 1], int_elem[i]);
-                exit(2);
-            }
-    }
-    if (opt_time)
-        printf(
-            "%.3g %.3g %.3g\n",
-            (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1e6,
-            ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,
-            ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
-    return (0);
+    // for (int i = 0; i < N_THREADS; ++i) {
+    //     if (pthread_join(threads[i], NULL) != 0) {
+    //         perror("Failed to join the thread");
+    //         exit(EXIT_FAILURE);
+    //     }
+    // }
+    // printf("Expect %d lines of output (including this one)\n",
+    //        2 * N_THREADS * nprints + N_THREADS + 2);
 
     return 0;
 }
