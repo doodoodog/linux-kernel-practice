@@ -258,7 +258,7 @@ void *thread(void *payload)
     return NULL;
 }
 
-work_t *print_task(work_t *w)
+work_t *qs_task(work_t *w)
 {
     int *payload = (int *) w->args[0];
     int item = *payload;
@@ -472,7 +472,7 @@ int main(int argc, char *argv[])
         init(&thread_queues[i], 8);
         for (int j = 0; j < nprints; ++j) {
             work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
-            work->code = &print_task;
+            work->code = &qs_task;
             work->join_count = 0;
             int *payload = malloc(sizeof(int));
             *payload = 1000 * i + j;
