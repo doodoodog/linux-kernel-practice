@@ -42,6 +42,8 @@ struct work_internal;
 typedef struct work_internal *(*task_t)(struct work_internal *);
 
 typedef struct work_internal {
+    int thread_id;
+    int fork_elems;
     task_t code;
     atomic_int join_count;
     void *args[];
@@ -68,6 +70,23 @@ typedef struct {
 #ifndef ELEM_T
 #define ELEM_T uint32_t
 #endif
+
+#ifndef thunk
+#define thunk NULL
+#endif thunk
+
+// ============ Quick Sort Parameters ============
+typedef struct quick_sort_param_task {
+    void *qs_addr;
+    size_t qs_n;
+} qs_param_t;
+// ===============================================
+
+typedef int cmp_t(const void *, const void *);
+int num_compare(const void *a, const void *b)
+{
+    return (*(ELEM_T *) a - *(ELEM_T *) b);
+}
 
 void init(deque_t *q, int size_hint)
 {
@@ -242,36 +261,34 @@ void *thread(void *payload)
     return NULL;
 }
 
-// work_t *print_task(work_t *w)
-// {
-//     int *payload = (int *) w->args[0];
-//     int item = *payload;
-//     printf("Did item %p with payload %d\n", w, item);
-//     work_t *cont = (work_t *) w->args[1];
-//     free(payload);
-//     free(w);
-//     return join_work(cont);
-// }
+work_t *qs_algo_task(work_t *w)
+{
+    qs_param_t *qs_param = (qs_param_t*)w->args[0];
+    printf("Did item %p with payload %d\n", w, item);
+    work_t *cont = (work_t *) w->args[1];
+    free(payload);
+    free(w);
+    return join_work(cont);
+}
 
 /* Thread-callable quicksort. */
-static void qsort_algo(struct qsort *qs)
+static void qsort_algo(work_t *w)
 {
+    qs_param_t *qs_param = (qs_param_t*)w->args[0];
     char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
     int d, r, swaptype, swap_cnt;
     void *a;      /* Array of elements. */
     size_t n, es; /* Number of elements; size. */
     cmp_t *cmp;
     int nl, nr;
-    struct common *c;
-    struct qsort *qs2;
+    work_t *work2;
 
     /* Initialize qsort arguments. */
-    c = qs->common;
-    es = c->es;
-    cmp = c->cmp;
-    swaptype = c->swaptype;
-    a = qs->a;
-    n = qs->n;
+    es = sizeof(ELEM_T);
+    cmp = num_compare;
+    swaptype = 2;
+    a = qs_param->qs_addr;
+    n = qs_param->qs_n;
 top:
     /* From here on qsort(3) business as usual. */
     swap_cnt = 0;
@@ -346,14 +363,22 @@ nevermind:
     nr = (pd - pc) / es;
 
     /* Now try to launch subthreads. */
-    if (nl > c->forkelem && nr > c->forkelem &&
-        (qs2 = allocate_thread(c)) != NULL) {
-        qs2->a = a;
-        qs2->n = nl;
-        verify(pthread_cond_signal(&qs2->cond_st));
-        verify(pthread_mutex_unlock(&qs2->mtx_st));
+    if (nl > w->fork_elems &&
+        (work2 = malloc(sizeof(work_t) + 2 * sizeof(void *)) != NULL))
+    {   /* Push new work into work queue. */
+        work2->code = &qsort_algo;
+        work2->join_count = 0;
+        qs_param_t* qs_param2 = malloc(sizeof(qs_param_t));
+        qs_param2->qs_addr = a;
+        qs_param2->qs_n = nl;
+        work2->thread_id = 0;
+        work2->fork_elems = w->fork_elems;
+        work2->args[0] = qs_param;
+        work2->args[1] = w->args[1];
+        push(&thread_queues[0], work);
+    }
     } else if (nl > 0) {
-        qs->a = a;
+        qs_param = a;
         qs->n = nl;
         qsort_algo(qs);
     }
@@ -371,9 +396,21 @@ work_t *done_task(work_t *w)
     return NULL;
 }
 
+void usage(void)
+{
+    fprintf(
+        stderr,
+        "usage: qsort_mt [-stv] [-f forkelements] [-h threads] [-n elements]\n"
+        "\t-l\tRun the libc version of qsort\n"
+        "\t-s\tTest with 20-byte strings, instead of integers\n"
+        "\t-t\tPrint timing results\n"
+        "\t-v\tVerify the integer results\n"
+        "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
+    exit(1);
+}
+
 int main(int argc, char **argv)
 {
-    bool opt_str = false;
     bool opt_time = false;
     bool opt_verify = false;
     bool opt_libc = false;
@@ -435,18 +472,10 @@ int main(int argc, char **argv)
     argc -= optind;
     argv += optind;
 
-    if (opt_str) {
-        str_elem = xmalloc(nelem * sizeof(char *));
-        for (int i = 0; i < nelem; i++)
-            if (asprintf(&str_elem[i], "%d%d", rand(), rand()) == -1) {
-                perror("asprintf");
-                exit(1);
-            }
-    } else {
-        int_elem = xmalloc(nelem * sizeof(ELEM_T));
-        for (int i = 0; i < nelem; i++)
-            int_elem[i] = rand() % nelem;
-    }
+
+    int_elem = xmalloc(nelem * sizeof(ELEM_T));
+    for (int i = 0; i < nelem; i++)
+        int_elem[i] = rand() % nelem;
 
     /* Check that top and bottom are 64-bit so they never overflow */
     static_assert(sizeof(atomic_size_t) == 8,
@@ -461,21 +490,22 @@ int main(int argc, char **argv)
     work_t *done_work = malloc(sizeof(work_t));
     done_work->code = &done_task;
     done_work->join_count = N_THREADS * nprints;
-
     for (int i = 0; i < N_THREADS; ++i) {
         tids[i] = i;
         init(&thread_queues[i], 8);
-        for (int j = 0; j < nprints; ++j) {
-            work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
-            work->code = &qsort_algo;
-            work->join_count = 0;
-            int *payload = malloc(sizeof(int));
-            *payload = 1000 * i + j;
-            work->args[0] = payload;
-            work->args[1] = done_work;
-            push(&thread_queues[i], work);
-        }
     }
+
+    work_t *work = malloc(sizeof(work_t) + 2 * sizeof(void *));
+    work->code = &qsort_algo;
+    work->join_count = 0;
+    qs_param_t* qs_param = malloc(sizeof(qs_param_t));
+    qs_param->qs_addr = int_elem;
+    qs_param->qs_n = nelem;
+    work->thread_id = 0;
+    work->fork_elems = forkelements;
+    work->args[0] = qs_param;
+    work->args[1] = done_work;
+    push(&thread_queues[0], work);
 
     for (int i = 0; i < N_THREADS; ++i) {
         if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
