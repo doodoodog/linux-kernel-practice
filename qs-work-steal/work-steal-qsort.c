@@ -22,6 +22,66 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+static inline void swapfunc(char *, char *, int, int);
+
+#define min(a, b)           \
+    ({                      \
+        typeof(a) _a = (a); \
+        typeof(b) _b = (b); \
+        _a < _b ? _a : _b;  \
+    })
+
+/* Qsort routine from Bentley & McIlroy's "Engineering a Sort Function" */
+#define swapcode(TYPE, parmi, parmj, n) \
+    {                                   \
+        long i = (n) / sizeof(TYPE);    \
+        TYPE *pi = (TYPE *) (parmi);    \
+        TYPE *pj = (TYPE *) (parmj);    \
+        do {                            \
+            TYPE t = *pi;               \
+            *pi++ = *pj;                \
+            *pj++ = t;                  \
+        } while (--i > 0);              \
+    }
+
+static inline void swapfunc(char *a, char *b, int n, int swaptype)
+{
+    if (swaptype <= 1)
+        swapcode(long, a, b, n) else swapcode(char, a, b, n)
+}
+
+#define swap(a, b)                         \
+    do {                                   \
+        if (swaptype == 0) {               \
+            long t = *(long *) (a);        \
+            *(long *) (a) = *(long *) (b); \
+            *(long *) (b) = t;             \
+        } else                             \
+            swapfunc(a, b, es, swaptype);  \
+    } while (0)
+
+#define vecswap(a, b, n)                 \
+    do {                                 \
+        if ((n) > 0)                     \
+            swapfunc(a, b, n, swaptype); \
+    } while (0)
+
+typedef int cmp_t(const void *, const void *);
+#define CMP(t, x, y) (cmp((x), (y)))
+static inline char *med3(char *a, char *b, char *c, cmp_t *cmp, void *thunk)
+{
+    return CMP(thunk, a, b) < 0
+               ? (CMP(thunk, b, c) < 0 ? b : (CMP(thunk, a, c) < 0 ? c : a))
+               : (CMP(thunk, b, c) > 0 ? b : (CMP(thunk, a, c) < 0 ? a : c));
+}
+
+/* Invariant common part, shared across invocations. */
+struct common {
+    int swaptype;           /* Code to use for swapping */
+    cmp_t *cmp;             /* Comparison function */
+    size_t es;              /* Element size. */
+};
+
 /* A 'task_t' represents a function pointer that accepts a pointer to a 'work_t'
  * struct as input and returns another 'work_t' struct as output. The input to
  * this function is always a pointer to the encompassing 'work_t' struct.
@@ -63,15 +123,11 @@ typedef struct {
     _Atomic(array_t *) array;
 } deque_t;
 
-/* Invariant common part, shared across invocations. */
-struct common {
-    int swaptype;           /* Code to use for swapping */
-    size_t es;              /* Element size. */
-    void *thunk;            /* Thunk for qsort_r */
-    int nthreads;           /* Total number of pool threads. */
-    int idlethreads;        /* Number of idle threads in pool. */
-    int forkelem;           /* Minimum number of elements for a new thread. */
-};
+/* Quick sort parameters.  */
+typedef struct qs_task_paramt {
+    void *qs_addr;
+    size_t qs_num;
+} paramt_t;
 
 void init(deque_t *q, int size_hint)
 {
@@ -213,6 +269,13 @@ work_t *join_work(work_t *work)
     return NULL;
 }
 
+work_t *done_task(work_t *w)
+{
+    free(w);
+    atomic_store(&done, true);
+    return NULL;
+}
+
 void *thread(void *payload)
 {
     int id = *(int *) payload;
@@ -258,27 +321,9 @@ void *thread(void *payload)
     return NULL;
 }
 
-work_t *qs_task(work_t *w)
-{
-    int *payload = (int *) w->args[0];
-    int item = *payload;
-    printf("Did item %p with payload %d\n", w, item);
-    work_t *cont = (work_t *) w->args[1];
-    free(payload);
-    free(w);
-    return join_work(cont);
-}
-
 int num_compare(const void *a, const void *b)
 {
     return (*(ELEM_T *) a - *(ELEM_T *) b);
-}
-
-work_t *done_task(work_t *w)
-{
-    free(w);
-    atomic_store(&done, true);
-    return NULL;
 }
 
 void *xmalloc(size_t s)
@@ -305,88 +350,146 @@ void usage(void)
     exit(1);
 }
 
-/* The multithreaded qsort public interface */
-void qsort_mt(void *a,
-              size_t n,
-              size_t es,
-              int maxthreads,
-              int forkelem)
+work_t *qs_task(work_t *w);
+/* Thread-callable quicksort. */
+static void qsort_algo(work_t *w)
 {
-    struct qsort *qs;
-    struct common c;
-    int i, islot;
-    bool bailout = true;
+    char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
+    int d, r, swaptype, swap_cnt;
+    void *a;      /* Array of elements. */
+    size_t n, es; /* Number of elements; size. */
+    cmp_t *cmp;
+    paramt_t *qs_paramt;
+    work_t *workend;
+    int nl, nr;
+    struct common *c;
 
-    if (n < forkelem)
-        goto f1;
-    errno = 0;
-    /* Try to initialize the resources we need. */
-    if (pthread_mutex_init(&c.mtx_al, NULL) != 0)
-        goto f1;
-    if ((c.pool = calloc(maxthreads, sizeof(struct qsort))) == NULL)
-        goto f2;
-    for (islot = 0; islot < maxthreads; islot++) {
-        qs = &c.pool[islot];
-        if (pthread_mutex_init(&qs->mtx_st, NULL) != 0)
-            goto f3;
-        if (pthread_cond_init(&qs->cond_st, NULL) != 0) {
-            verify(pthread_mutex_destroy(&qs->mtx_st));
-            goto f3;
+    /* Initialize qsort arguments. */
+    c = w->common;
+    qs_paramt = (paramt_t *)w->args[0];
+    es = c->es;
+    cmp = c->cmp;
+    swaptype = c->swaptype;
+    a = qs_paramt->qs_addr;
+    n = qs_paramt->qs_num;
+top:
+    /* From here on qsort(3) business as usual. */
+    swap_cnt = 0;
+    if (n < 7) {
+        for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
+            for (pl = pm; pl > (char *) a && CMP(thunk, pl - es, pl) > 0;
+                 pl -= es)
+                swap(pl, pl - es);
+        return;
+    }
+    pm = (char *) a + (n / 2) * es;
+    if (n > 7) {
+        pl = (char *) a;
+        pn = (char *) a + (n - 1) * es;
+        if (n > 40) {
+            d = (n / 8) * es;
+            pl = med3(pl, pl + d, pl + 2 * d, cmp, thunk);
+            pm = med3(pm - d, pm, pm + d, cmp, thunk);
+            pn = med3(pn - 2 * d, pn - d, pn, cmp, thunk);
         }
-        qs->st = ts_idle;
-        qs->common = &c;
-        if (pthread_create(&qs->id, NULL, qsort_thread, qs) != 0) {
-            verify(pthread_mutex_destroy(&qs->mtx_st));
-            verify(pthread_cond_destroy(&qs->cond_st));
-            goto f3;
+        pm = med3(pl, pm, pn, cmp, thunk);
+    }
+    swap(a, pm);
+    pa = pb = (char *) a + es;
+
+    pc = pd = (char *) a + (n - 1) * es;
+    for (;;) {
+        while (pb <= pc && (r = CMP(thunk, pb, a)) <= 0) {
+            if (r == 0) {
+                swap_cnt = 1;
+                swap(pa, pb);
+                pa += es;
+            }
+            pb += es;
         }
+        while (pb <= pc && (r = CMP(thunk, pc, a)) >= 0) {
+            if (r == 0) {
+                swap_cnt = 1;
+                swap(pc, pd);
+                pd -= es;
+            }
+            pc -= es;
+        }
+        if (pb > pc)
+            break;
+        swap(pb, pc);
+        swap_cnt = 1;
+        pb += es;
+        pc -= es;
     }
 
-    /* All systems go. */
-    bailout = false;
+    pn = (char *) a + n * es;
+    r = min(pa - (char *) a, pb - pa);
+    vecswap(a, pb - r, r);
+    r = min(pd - pc, pn - pd - es);
+    vecswap(pb, pn - r, r);
 
-    /* Initialize common elements. */
-    c.swaptype = ((char *) a - (char *) 0) % sizeof(long) || es % sizeof(long)
-                     ? 2
-                 : es == sizeof(long) ? 0
-                                      : 1;
-    c.es = es;
-    c.cmp = cmp;
-    c.forkelem = forkelem;
-    c.idlethreads = c.nthreads = maxthreads;
-
-    /* Hand out the first work batch. */
-    qs = &c.pool[0];
-    verify(pthread_mutex_lock(&qs->mtx_st));
-    qs->a = a;
-    qs->n = n;
-    qs->st = ts_work;
-    c.idlethreads--;
-    verify(pthread_cond_signal(&qs->cond_st));
-    verify(pthread_mutex_unlock(&qs->mtx_st));
-
-    /* Wait for all threads to finish, and free acquired resources. */
-f3:
-    for (i = 0; i < islot; i++) {
-        qs = &c.pool[i];
-        if (bailout) {
-            verify(pthread_mutex_lock(&qs->mtx_st));
-            qs->st = ts_term;
-            verify(pthread_cond_signal(&qs->cond_st));
-            verify(pthread_mutex_unlock(&qs->mtx_st));
-        }
-        verify(pthread_join(qs->id, NULL));
-        verify(pthread_mutex_destroy(&qs->mtx_st));
-        verify(pthread_cond_destroy(&qs->cond_st));
+    if (swap_cnt == 0) { /* Switch to insertion sort */
+        r = 1 + n / 4;   /* n >= 7, so r >= 2 */
+        for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
+            for (pl = pm; pl > (char *) a && CMP(thunk, pl - es, pl) > 0;
+                 pl -= es) {
+                swap(pl, pl - es);
+                if (++swap_cnt > r)
+                    goto nevermind;
+            }
+        return;
     }
-    free(c.pool);
-f2:
-    verify(pthread_mutex_destroy(&c.mtx_al));
-    if (bailout) {
-        fprintf(stderr, "Resource initialization failed; bailing out.\n");
-    f1:
-        qsort(a, n, es, cmp);
+
+nevermind:
+    nl = (pb - pa) / es;
+    nr = (pd - pc) / es;
+
+    /* Now try to launch subthreads. */
+    if(nl > 0)
+    {
+        work_t *work1 = malloc(sizeof(work_t) + 2 * sizeof(void *));
+        work1->code = &qs_task;
+    	work1->join_count = 1;
+        work1->common = malloc(sizeof(struct common));
+        memcpy(work1->common, c, sizeof(struct common));
+    	paramt_t *paramt1 = malloc(sizeof(paramt_t));
+    	paramt1->qs_addr = a;
+    	paramt1->qs_num = nl;
+    	work1->args[0] = paramt1;
+    	work1->args[1] = w->args[1];
+        workend = (work_t *)w->args[1];
+        atomic_fetch_add(&workend->join_count, 1);
+    	push(&thread_queues[0], work1);
     }
+    if(nr > 0)
+    {
+        work_t *work2 = malloc(sizeof(work_t) + 2 * sizeof(void *));
+        work2->code = &qs_task;
+    	work2->join_count = 1;
+        work2->common = malloc(sizeof(struct common));
+        memcpy(work2->common, c, sizeof(struct common));
+    	paramt_t *paramt2 = malloc(sizeof(paramt_t));
+    	paramt2->qs_addr = pn - nr * es;
+    	paramt2->qs_num = nr;
+    	work2->args[0] = paramt2;
+    	work2->args[1] = w->args[1];
+        workend = (work_t *)w->args[1];
+        atomic_fetch_add(&workend->join_count, 1);
+    	push(&thread_queues[0], work2);
+    }
+    return;
+}
+
+work_t *qs_task(work_t *w)
+{
+    qsort_algo(w);
+    printf("Did item %p with payload %d\n", w, w->join_count);
+    work_t *cont = (work_t *) w->args[1];
+    free(w->common);
+    free(w->args[0]);
+    free(w);
+    return join_work(cont);
 }
 
 int main(int argc, char *argv[])
@@ -396,7 +499,7 @@ int main(int argc, char *argv[])
     bool opt_libc = false;
     int ch, i;
     size_t nelem = 10000000;
-    int threads = 2;
+    int threadnum = 2;
     int forkelements = 100;
     ELEM_T *int_elem;
     char *ep;
@@ -415,8 +518,8 @@ int main(int argc, char *argv[])
             }
             break;
         case 'h':
-            threads = (int) strtol(optarg, &ep, 10);
-            if (threads < 0 || *ep != '\0') {
+            threadnum = (int) strtol(optarg, &ep, 10);
+            if (threadnum < 0 || *ep != '\0') {
                 warnx("illegal number, -h argument -- %s", optarg);
                 usage();
             }
@@ -462,25 +565,29 @@ int main(int argc, char *argv[])
     thread_queues = malloc(N_THREADS * sizeof(deque_t));
     int nprints = 10;
 
-    atomic_store(&done, false);
-    work_t *done_work = malloc(sizeof(work_t));
-    done_work->code = &done_task;
-    done_work->join_count = N_THREADS * nprints;
-
     for (int i = 0; i < N_THREADS; ++i) {
         tids[i] = i;
         init(&thread_queues[i], 8);
-        for (int j = 0; j < nprints; ++j) {
-            work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
-            work->code = &qs_task;
-            work->join_count = 0;
-            int *payload = malloc(sizeof(int));
-            *payload = 1000 * i + j;
-            work->args[0] = payload;
-            work->args[1] = done_work;
-            push(&thread_queues[i], work);
-        }
     }
+
+    atomic_store(&done, false);
+    work_t *done_work = malloc(sizeof(work_t));
+    done_work->code = &done_task;
+    done_work->join_count = 1;
+
+    work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
+    work->code = &qs_task;
+    work->join_count = 1;
+    work->common = malloc(sizeof(struct common));
+    work->common->es = sizeof(ELEM_T);
+    work->common->swaptype = 2;
+    work->common->cmp = &num_compare;
+    paramt_t *qs_paramt = malloc(sizeof(paramt_t));
+    qs_paramt->qs_addr = int_elem;
+    qs_paramt->qs_num = nelem;
+    work->args[0] = qs_paramt;
+    work->args[1] = done_work;
+    push(&thread_queues[0], work);
 
     for (int i = 0; i < N_THREADS; ++i) {
         if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
