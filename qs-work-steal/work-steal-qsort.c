@@ -132,7 +132,7 @@ typedef struct qs_task_paramt {
 void init(deque_t *q, int size_hint)
 {
     atomic_init(&q->top, 0);
-    atomic_init(&q->bottom, 0);
+    atomic_init(&q->bottom, 1);
     array_t *a = malloc(sizeof(array_t) + sizeof(work_t *) * size_hint);
     atomic_init(&a->size, size_hint);
     atomic_init(&q->array, a);
@@ -209,6 +209,15 @@ work_t *take(deque_t *q)
         atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);
     }
     return x;
+}
+
+void print_arrays(void *a, size_t n) {
+	ELEM_T* array = (ELEM_T *)a;
+	printf("=========== Dump ============\n");
+	for(int i=0; i<n; i++) 
+		printf("%u ", array[i]);
+	printf("\n");
+    printf("=============================\n");
 }
 
 void push(deque_t *q, work_t *w)
@@ -346,6 +355,7 @@ void usage(void)
         "\t-s\tTest with 20-byte strings, instead of integers\n"
         "\t-t\tPrint timing results\n"
         "\t-v\tVerify the integer results\n"
+        "\t-d\tDebug mode\n"
         "Defaults are 1e7 elements, 2 threads, 100 fork elements\n");
     exit(1);
 }
@@ -494,6 +504,7 @@ work_t *qs_task(work_t *w)
 
 int main(int argc, char *argv[])
 {
+    bool opt_debug = false;
     bool opt_time = false;
     bool opt_verify = false;
     bool opt_libc = false;
@@ -508,7 +519,7 @@ int main(int argc, char *argv[])
     struct rusage ru;
 
     gettimeofday(&start, NULL);
-    while ((ch = getopt(argc, argv, "f:h:ln:stv")) != -1) {
+    while ((ch = getopt(argc, argv, "f:h:ln:stvd")) != -1) {
         switch (ch) {
         case 'f':
             forkelements = (int) strtol(optarg, &ep, 10);
@@ -540,6 +551,9 @@ int main(int argc, char *argv[])
         case 'v':
             opt_verify = true;
             break;
+        case 'd':
+            opt_debug = true;
+            break;
         case '?':
         default:
             usage();
@@ -555,6 +569,11 @@ int main(int argc, char *argv[])
     int_elem = xmalloc(nelem * sizeof(ELEM_T));
     for (i = 0; i < nelem; i++)
         int_elem[i] = rand() % nelem;
+
+    if (opt_debug)
+    {
+        print_arrays(int_elem, nelem);
+    }
 
     /* Check that top and bottom are 64-bit so they never overflow */
     static_assert(sizeof(atomic_size_t) == 8,
@@ -616,6 +635,11 @@ int main(int argc, char *argv[])
                         i, int_elem[i - 1], int_elem[i]);
                 exit(2);
             }
+    }
+
+    if (opt_debug)
+    {
+        print_arrays(int_elem, nelem);
     }
 
     if (opt_time)

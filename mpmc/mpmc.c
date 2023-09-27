@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define PAGE_SIZE 4096     /* FIXME: avoid hard-coded */
 #define CACHE_LINE_SIZE 64 /* FIXME: make it configurable */
@@ -32,26 +33,26 @@ static inline void *align_alloc(size_t align, size_t size)
 #define N_BITS (N - 1)
 
 typedef struct __node {
-    struct __node *volatile next __DOUBLE___CACHE_ALIGNED;
-    long id __DOUBLE___CACHE_ALIGNED;
+    _Atomic (struct __node*) next __DOUBLE___CACHE_ALIGNED;
+    atomic_long id __DOUBLE___CACHE_ALIGNED;
     void *cells[N] __DOUBLE___CACHE_ALIGNED;
 } node_t;
 
 #define N_HANDLES 128 /* support 127 threads */
 
 typedef struct {
-    node_t *spare;
+    _Atomic (struct __node*) spare;
 
-    node_t *volatile push __CACHE_ALIGNED;
-    node_t *volatile pop __CACHE_ALIGNED;
+    _Atomic (struct __node*) push __CACHE_ALIGNED;
+    _Atomic (struct __node*) pop __CACHE_ALIGNED;
 } handle_t;
 
 typedef struct {
-    node_t *init_node;
-    volatile long init_id __DOUBLE___CACHE_ALIGNED;
+    _Atomic (struct __node*) init_node;
+    atomic_long init_id __DOUBLE___CACHE_ALIGNED;
 
-    volatile long put_index __DOUBLE___CACHE_ALIGNED;
-    volatile long pop_index __DOUBLE___CACHE_ALIGNED;
+    atomic_long put_index __DOUBLE___CACHE_ALIGNED;
+    atomic_long pop_index __DOUBLE___CACHE_ALIGNED;
 
     handle_t *enqueue_handles[N_HANDLES], *dequeue_handles[N_HANDLES];
 
